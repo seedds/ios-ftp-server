@@ -1,0 +1,82 @@
+name: Release unsigned IPA
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["**.md", ".gitignore"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# Releases run one at a time so each one sees the previous tag and picks the next number.
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && format('pr-{0}', github.ref) || 'release' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Test FTP engine
+        run: swift test --package-path FTPServerKit
+
+      # Version is MARKETING_VERSION from project.yml plus the next free patch number
+      # (v1.0.0, v1.0.1, …); bump MARKETING_VERSION to start a new series.
+      - name: Pick version
+        id: version
+        run: |
+          base=$(sed -nE 's/^ *MARKETING_VERSION: *"?([0-9]+\.[0-9]+)"?.*$/\1/p' project.yml | head -1)
+          [[ -n "$base" ]] || { echo "::error::MARKETING_VERSION not found in project.yml"; exit 1; }
+          released=$(git tag --points-at HEAD --list "v$base.*" | head -1)
+          if [[ -n "$released" ]]; then
+            echo "Commit already released as $released"
+            echo "version=${released#v}" >> "$GITHUB_OUTPUT"
+            echo "released=true" >> "$GITHUB_OUTPUT"
+          else
+            last=$(git tag --list "v$base.*" | sed "s/^v$base\.//" | grep -E '^[0-9]+$' | sort -n | tail -1 || true)
+            echo "version=$base.$(( ${last:--1} + 1 ))" >> "$GITHUB_OUTPUT"
+            echo "released=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build unsigned IPA
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: scripts/build-unsigned-ipa.sh --version "$VERSION" --build "$GITHUB_RUN_NUMBER"
+
+      - name: Upload build log
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-log
+          path: build/build.log
+          if-no-files-found: ignore
+
+      - name: Upload IPA artifact
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v7
+        with:
+          name: FTPServer-${{ steps.version.outputs.version }}-unsigned
+          path: build/*.ipa
+          retention-days: 14
+
+      - name: Publish release
+        if: github.event_name != 'pull_request' && steps.version.outputs.released == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          gh release create "v$VERSION" build/*.ipa \
+            --target "$GITHUB_SHA" \
+            --title "FTP Server $VERSION" \
+            --generate-notes \
+            --notes "Unsigned build $VERSION ($GITHUB_RUN_NUMBER), iOS 17+. Sign it before installing: Sideloadly, AltStore, TrollStore, or your own certificate."
